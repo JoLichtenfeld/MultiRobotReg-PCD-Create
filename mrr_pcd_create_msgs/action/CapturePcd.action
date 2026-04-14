@@ -1,0 +1,22 @@
+# Goal: request to capture pointcloud from a specific robot
+string pc_topic
+string imu_topic
+float32 acc_time_s
+float32 imu_dur_s
+bool use_imu
+---
+# Result: returns the captured data info
+string robot_ns
+string output_dir
+uint32 num_points
+float32 gravity_x
+float32 gravity_y
+float32 gravity_z
+bool success
+string error_msg
+---
+# Feedback: progress during capture
+string status
+float32 progress
+uint32 cloud_count
+uint32 imu_samples_count
