@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -37,13 +38,17 @@ using GoalHandleCapturePcd = rclcpp_action::ClientGoalHandle<CapturePcd>;
 struct RobotConfig {
   std::string robot_ns;
   std::string capture_action_name;
+  rclcpp_action::Client<CapturePcd>::SharedPtr action_client;
   std::vector<std::string> pc_topics;
   std::vector<std::string> imu_topics;
   std::chrono::steady_clock::time_point last_announcement_time{};
+  std::string last_output_dir;
   
   char pc_topic_buf[256] = "";
   char pc_topic_2_buf[256] = "";
   char imu_topic_buf[256] = "";
+  char sync_host_buf[128] = "";
+  char sync_user_buf[64] = "";
   char lidar_1_to_2_tf_buf[1024] =
     "1 0 0 0\n"
     "0 1 0 0\n"
@@ -57,6 +62,8 @@ struct RobotConfig {
   std::string status_msg;
   float progress = 0.0f;
   bool capturing = false;
+  bool has_result = false;
+  bool last_result_success = false;
 };
 
 struct LogEntry {
@@ -84,9 +91,37 @@ public:
 
   std::map<std::string, RobotConfig> robots;
   std::vector<LogEntry> log_entries;
+  char sync_local_root_buf[256] = "/tmp/mrr_pcd_sync";
 
 private:
   rclcpp::Subscription<mrr_pcd_create_msgs::msg::RobotAnnouncement>::SharedPtr announcement_sub_;
+
+  static std::string robot_ns_to_host_hint(const std::string & robot_ns) {
+    std::string key = robot_ns;
+    if (!key.empty() && key.front() == '/') {
+      key.erase(key.begin());
+    }
+    if (key.empty()) {
+      key = "robot";
+    }
+    std::replace(key.begin(), key.end(), '/', '-');
+    return key;
+  }
+
+  static std::string shell_quote(const std::string & value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('\'');
+    for (char c : value) {
+      if (c == '\'') {
+        out += "'\\''";
+      } else {
+        out.push_back(c);
+      }
+    }
+    out.push_back('\'');
+    return out;
+  }
 
   void on_announcement(const mrr_pcd_create_msgs::msg::RobotAnnouncement::SharedPtr msg) {
     auto it = robots.find(msg->robot_ns);
@@ -99,6 +134,8 @@ private:
       cfg.pc_topics = msg->available_pc_topics;
       cfg.imu_topics = msg->available_imu_topics;
       cfg.last_announcement_time = std::chrono::steady_clock::now();
+      const std::string host_hint = robot_ns_to_host_hint(msg->robot_ns);
+      std::strncpy(cfg.sync_host_buf, host_hint.c_str(), sizeof(cfg.sync_host_buf) - 1);
       
       // Auto-select first available topics
       if (!cfg.pc_topics.empty()) {
@@ -185,16 +222,83 @@ public:
     }
   }
 
+  bool sync_robot_last_output(const std::string & robot_ns, RobotConfig & cfg) {
+    if (cfg.last_output_dir.empty()) {
+      add_log("  [" + robot_ns + "] SKIPPED: no captured output directory yet");
+      return false;
+    }
+
+    const std::string host(cfg.sync_host_buf);
+    if (host.empty()) {
+      add_log("  [" + robot_ns + "] ERROR: sync host is empty");
+      cfg.status_msg = "ERROR: Sync host is empty";
+      return false;
+    }
+
+    const std::string user(cfg.sync_user_buf);
+    const std::string remote_spec = user.empty() ? host : (user + "@" + host);
+    const std::filesystem::path remote_path(cfg.last_output_dir);
+    const std::string leaf = remote_path.filename().string().empty() ? "capture" : remote_path.filename().string();
+    const std::string local_root(sync_local_root_buf);
+    const std::string robot_leaf = robot_ns_to_host_hint(robot_ns);
+    const std::filesystem::path local_target = std::filesystem::path(local_root) / robot_leaf / leaf;
+
+    std::error_code ec;
+    std::filesystem::create_directories(local_target.parent_path(), ec);
+    if (ec) {
+      add_log("  [" + robot_ns + "] ERROR: cannot create local sync directory: " + ec.message());
+      cfg.status_msg = "ERROR: cannot create local sync directory";
+      return false;
+    }
+
+    std::ostringstream cmd;
+    cmd << "rsync -az "
+        << shell_quote(remote_spec + ":" + cfg.last_output_dir + "/") << " "
+        << shell_quote(local_target.string() + "/");
+
+    add_log("  [" + robot_ns + "] Syncing " + cfg.last_output_dir + " -> " + local_target.string());
+    const int rc = std::system(cmd.str().c_str());
+    if (rc != 0) {
+      cfg.status_msg = "ERROR: Sync failed";
+      add_log("  [" + robot_ns + "] ERROR: rsync failed (code " + std::to_string(rc) + ")");
+      return false;
+    }
+
+    cfg.status_msg = "Synced to " + local_target.string();
+    add_log("  [" + robot_ns + "] Sync complete: " + local_target.string());
+    return true;
+  }
+
+  void sync_all_last_outputs() {
+    if (robots.empty()) {
+      add_log("Sync skipped: no robots discovered");
+      return;
+    }
+
+    add_log("Syncing latest captures from all robots...");
+    std::size_t ok_count = 0;
+    for (auto & [robot_ns, cfg] : robots) {
+      if (sync_robot_last_output(robot_ns, cfg)) {
+        ++ok_count;
+      }
+    }
+    add_log("Sync summary: " + std::to_string(ok_count) + "/" + std::to_string(robots.size()) +
+            " robot outputs copied");
+  }
+
 private:
   void trigger_capture(const std::string& robot_ns, RobotConfig& cfg) {
     // Create action client
-    auto action_client = rclcpp_action::create_client<CapturePcd>(
+    cfg.action_client = rclcpp_action::create_client<CapturePcd>(
       this, cfg.capture_action_name);
+    auto action_client = cfg.action_client;
 
     add_log("  [" + robot_ns + "] Using action endpoint: " + cfg.capture_action_name);
 
     if (!action_client->wait_for_action_server(std::chrono::seconds(2))) {
       cfg.status_msg = "Server not responding";
+      cfg.has_result = true;
+      cfg.last_result_success = false;
       add_log("  [" + robot_ns + "] ERROR: Action server not responding at " +
               cfg.capture_action_name);
       return;
@@ -212,6 +316,8 @@ private:
       cfg.use_second_lidar ? std::string(cfg.lidar_1_to_2_tf_buf) : std::string();
 
     cfg.capturing = true;
+    cfg.has_result = false;
+    cfg.last_result_success = false;
     cfg.progress = 0.0f;
     cfg.status_msg = "Capturing...";
 
@@ -219,6 +325,9 @@ private:
     send_goal_options.goal_response_callback =
       [this, robot_ns, &cfg](const GoalHandleCapturePcd::SharedPtr& handle) {
         if (!handle) {
+          cfg.capturing = false;
+          cfg.has_result = true;
+          cfg.last_result_success = false;
           cfg.status_msg = "Goal rejected";
           add_log("  [" + robot_ns + "] ERROR: Goal rejected");
         }
@@ -236,13 +345,23 @@ private:
     send_goal_options.result_callback =
       [this, robot_ns, &cfg](const GoalHandleCapturePcd::WrappedResult& result) {
         cfg.capturing = false;
+        cfg.has_result = true;
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
-          cfg.status_msg = "Done: " + std::to_string(result.result->num_points) + " merged points";
+          cfg.last_result_success = true;
+          cfg.last_output_dir = result.result->output_dir;
+          cfg.status_msg = "Done: " + std::to_string(result.result->num_points) +
+                           " merged points | " + result.result->output_dir;
           add_log("  [" + robot_ns + "] SUCCESS: " + std::to_string(result.result->num_points) + 
                   " merged points saved to " + result.result->output_dir);
+        } else if (result.code == rclcpp_action::ResultCode::CANCELED) {
+          cfg.last_result_success = false;
+          cfg.status_msg = "CANCELED";
+          add_log("  [" + robot_ns + "] CANCELED");
         } else {
-          cfg.status_msg = "FAILED: " + result.result->error_msg;
-          add_log("  [" + robot_ns + "] ERROR: " + result.result->error_msg);
+          cfg.last_result_success = false;
+          const std::string error_msg = result.result ? result.result->error_msg : "Unknown action error";
+          cfg.status_msg = "FAILED: " + error_msg;
+          add_log("  [" + robot_ns + "] ERROR: " + error_msg);
         }
       };
 
@@ -280,11 +399,8 @@ static void topic_combo(const char* label,
   ImGui::TextUnformatted(label);
 
   if (ImGui::BeginPopup(popup_id)) {
-    const std::string filter(buf);
     bool any = false;
     for (const auto& t : topics) {
-      const bool match = (filter.size() <= 1) || (t.find(filter) != std::string::npos);
-      if (!match) continue;
       any = true;
       if (ImGui::Selectable(t.c_str())) {
         std::strncpy(buf, t.c_str(), buf_size - 1);
@@ -413,8 +529,32 @@ int main(int argc, char** argv) {
           // Status
           if (cfg.capturing) {
             ImGui::ProgressBar(cfg.progress, ImVec2(-1.0f, 0.0f), "");
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "CAPTURING: %s", cfg.status_msg.c_str());
+          } else if (cfg.has_result && cfg.last_result_success) {
+            ImGui::TextColored(ImVec4(0.30f, 1.0f, 0.30f, 1.0f), "SUCCESS: %s", cfg.status_msg.c_str());
+          } else if (cfg.has_result) {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", cfg.status_msg.c_str());
+          } else {
+            ImGui::TextWrapped("%s", cfg.status_msg.c_str());
           }
-          ImGui::TextWrapped("%s", cfg.status_msg.c_str());
+          if (!cfg.last_output_dir.empty()) {
+            ImGui::TextWrapped("Last output: %s", cfg.last_output_dir.c_str());
+          }
+
+          ImGui::InputText(("Sync host##" + robot_ns).c_str(),
+                           cfg.sync_host_buf, sizeof(cfg.sync_host_buf));
+          ImGui::InputText(("Sync user (optional)##" + robot_ns).c_str(),
+                           cfg.sync_user_buf, sizeof(cfg.sync_user_buf));
+
+          if (cfg.capturing || cfg.last_output_dir.empty()) {
+            ImGui::BeginDisabled();
+          }
+          if (ImGui::Button(("Copy/Sync Last Dump##" + robot_ns).c_str())) {
+            node->sync_robot_last_output(robot_ns, cfg);
+          }
+          if (cfg.capturing || cfg.last_output_dir.empty()) {
+            ImGui::EndDisabled();
+          }
 
           if (!active) {
             ImGui::EndDisabled();
@@ -457,6 +597,13 @@ int main(int argc, char** argv) {
       node->trigger_capture_all();
     }
     if (any_capturing || !any_active) ImGui::EndDisabled();
+
+    ImGui::InputText("Sync local root", node->sync_local_root_buf, sizeof(node->sync_local_root_buf));
+    if (any_capturing) ImGui::BeginDisabled();
+    if (ImGui::Button("COPY/SYNC ALL", button_size)) {
+      node->sync_all_last_outputs();
+    }
+    if (any_capturing) ImGui::EndDisabled();
 
     ImGui::PopStyleColor(3);
 

@@ -138,6 +138,23 @@ private:
     return has_x && has_y && has_z;
   }
 
+  static bool type_name_has_suffix(const std::string & type_name, const std::string & suffix) {
+    if (type_name.size() < suffix.size()) {
+      return false;
+    }
+    return type_name.compare(type_name.size() - suffix.size(), suffix.size(), suffix) == 0;
+  }
+
+  static bool is_pointcloud2_type(const std::string & type_name) {
+    return type_name == "sensor_msgs/msg/PointCloud2" ||
+           type_name_has_suffix(type_name, "/PointCloud2");
+  }
+
+  static bool is_imu_type(const std::string & type_name) {
+    return type_name == "sensor_msgs/msg/Imu" ||
+           type_name_has_suffix(type_name, "/Imu");
+  }
+
   static bool parse_transform_matrix(
     const std::string & text,
     Eigen::Matrix4f & lidar_1_to_2,
@@ -267,13 +284,13 @@ private:
     // robot identity namespace and would otherwise hide valid lidar/IMU topics.
     for (const auto& [topic, types] : this->get_topic_names_and_types()) {
       for (const auto& t : types) {
-        if (t == "sensor_msgs/msg/PointCloud2") {
+        if (is_pointcloud2_type(t)) {
           if (std::find(ann.available_pc_topics.begin(), ann.available_pc_topics.end(), topic) ==
               ann.available_pc_topics.end()) {
             ann.available_pc_topics.push_back(topic);
           }
         }
-        if (t == "sensor_msgs/msg/Imu") {
+        if (is_imu_type(t)) {
           if (std::find(ann.available_imu_topics.begin(), ann.available_imu_topics.end(), topic) ==
               ann.available_imu_topics.end()) {
             ann.available_imu_topics.push_back(topic);
