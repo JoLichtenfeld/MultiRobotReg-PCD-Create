@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -380,6 +381,7 @@ private:
     PointCloudCapture lidar_1_capture;
     PointCloudCapture lidar_2_capture;
     std::vector<ImuSample> imu_samples;
+    std::mutex capture_mutex;
     lidar_2_capture.done = !goal->use_second_lidar;
     bool imu_done = !goal->use_imu;
 
@@ -409,7 +411,8 @@ private:
     auto sensor_qos = rclcpp::SensorDataQoS();
     auto pc_sub_1 = this->create_subscription<sensor_msgs::msg::PointCloud2>(
       goal->pc_topic, sensor_qos,
-      [&cloud_callback, &lidar_1_capture](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+      [&cloud_callback, &lidar_1_capture, &capture_mutex](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> lock(capture_mutex);
         cloud_callback(lidar_1_capture, std::move(msg));
       });
     RCLCPP_INFO(this->get_logger(), "Subscribed to lidar 1 topic: %s", goal->pc_topic.c_str());
@@ -418,7 +421,8 @@ private:
     if (goal->use_second_lidar) {
       pc_sub_2 = this->create_subscription<sensor_msgs::msg::PointCloud2>(
         goal->pc_topic_2, sensor_qos,
-        [&cloud_callback, &lidar_2_capture](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+        [&cloud_callback, &lidar_2_capture, &capture_mutex](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(capture_mutex);
           cloud_callback(lidar_2_capture, std::move(msg));
         });
       RCLCPP_INFO(this->get_logger(), "Subscribed to lidar 2 topic: %s", goal->pc_topic_2.c_str());
@@ -427,7 +431,11 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
     if (goal->use_imu) {
       imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(
-        goal->imu_topic, sensor_qos, imu_callback);
+        goal->imu_topic, sensor_qos,
+        [&imu_callback, &capture_mutex](sensor_msgs::msg::Imu::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lock(capture_mutex);
+          imu_callback(std::move(msg));
+        });
       RCLCPP_INFO(this->get_logger(), "Subscribed to IMU topic: %s", goal->imu_topic.c_str());
     }
 
@@ -467,20 +475,37 @@ private:
       auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - record_start).count();
 
+      size_t lidar_1_cloud_count = 0;
+      size_t lidar_2_cloud_count = 0;
+      size_t imu_sample_count = 0;
+      bool lidar_1_done = false;
+      bool lidar_2_done = false;
+
       // Time-based completion
-      if (!lidar_1_capture.done && goal->acc_time_s > 0.0f && elapsed >= static_cast<double>(goal->acc_time_s)) {
-        lidar_1_capture.done = true;
-      }
-      if (!lidar_2_capture.done && goal->acc_time_s > 0.0f && elapsed >= static_cast<double>(goal->acc_time_s)) {
-        lidar_2_capture.done = true;
-      }
-      if (!imu_done && goal->use_imu && elapsed >= static_cast<double>(goal->imu_dur_s)) {
-        imu_done = true;
+      {
+        std::lock_guard<std::mutex> lock(capture_mutex);
+        if (!lidar_1_capture.done && goal->acc_time_s > 0.0f &&
+            elapsed >= static_cast<double>(goal->acc_time_s)) {
+          lidar_1_capture.done = true;
+        }
+        if (!lidar_2_capture.done && goal->acc_time_s > 0.0f &&
+            elapsed >= static_cast<double>(goal->acc_time_s)) {
+          lidar_2_capture.done = true;
+        }
+        if (!imu_done && goal->use_imu && elapsed >= static_cast<double>(goal->imu_dur_s)) {
+          imu_done = true;
+        }
+
+        lidar_1_cloud_count = lidar_1_capture.cloud_count;
+        lidar_2_cloud_count = lidar_2_capture.cloud_count;
+        imu_sample_count = imu_samples.size();
+        lidar_1_done = lidar_1_capture.done;
+        lidar_2_done = lidar_2_capture.done;
       }
 
       // Send feedback
       feedback->progress = 1.0f;
-      if ((!lidar_1_capture.done || !lidar_2_capture.done) && goal->acc_time_s > 0.0f) {
+      if ((!lidar_1_done || !lidar_2_done) && goal->acc_time_s > 0.0f) {
         feedback->progress = static_cast<float>(
           std::min(elapsed / static_cast<double>(goal->acc_time_s), 1.0));
         char buf[192];
@@ -489,11 +514,11 @@ private:
                         "Recording PC: %.1f / %.1f s [lidar1=%zu, lidar2=%zu clouds]",
                         std::min(elapsed, static_cast<double>(goal->acc_time_s)),
                         static_cast<double>(goal->acc_time_s),
-                        lidar_1_capture.cloud_count, lidar_2_capture.cloud_count);
+                        lidar_1_cloud_count, lidar_2_cloud_count);
         } else {
           std::snprintf(buf, sizeof(buf), "Recording PC: %.1f / %.1f s [%zu clouds]",
                         std::min(elapsed, static_cast<double>(goal->acc_time_s)),
-                        static_cast<double>(goal->acc_time_s), lidar_1_capture.cloud_count);
+                        static_cast<double>(goal->acc_time_s), lidar_1_cloud_count);
         }
         feedback->status = buf;
       } else if (goal->use_imu && !imu_done) {
@@ -502,18 +527,18 @@ private:
         char buf[128];
         std::snprintf(buf, sizeof(buf), "PC done. IMU: %.1f / %.1f s [%zu samples]",
                       std::min(elapsed, static_cast<double>(goal->imu_dur_s)),
-                      static_cast<double>(goal->imu_dur_s), imu_samples.size());
+                      static_cast<double>(goal->imu_dur_s), imu_sample_count);
         feedback->status = buf;
       } else {
         feedback->status = "Done";
       }
 
       feedback->cloud_count = static_cast<uint32_t>(
-        lidar_1_capture.cloud_count + lidar_2_capture.cloud_count);
-      feedback->imu_samples_count = imu_samples.size();
+        lidar_1_cloud_count + lidar_2_cloud_count);
+      feedback->imu_samples_count = imu_sample_count;
       goal_handle->publish_feedback(feedback);
 
-      if (lidar_1_capture.done && lidar_2_capture.done && imu_done) {
+      if (lidar_1_done && lidar_2_done && imu_done) {
         break;
       }
 
@@ -525,6 +550,16 @@ private:
     pc_sub_2.reset();
     imu_sub.reset();
 
+    PointCloudCapture lidar_1_snapshot;
+    PointCloudCapture lidar_2_snapshot;
+    std::vector<ImuSample> imu_samples_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(capture_mutex);
+      lidar_1_snapshot = lidar_1_capture;
+      lidar_2_snapshot = lidar_2_capture;
+      imu_samples_snapshot = imu_samples;
+    }
+
     if (goal_handle->is_canceling()) {
       result->error_msg = "Capture canceled by client";
       RCLCPP_INFO(this->get_logger(), "%s", result->error_msg.c_str());
@@ -533,14 +568,14 @@ private:
     }
 
     // Save results
-    if (!lidar_1_capture.accumulated_valid) {
+    if (!lidar_1_snapshot.accumulated_valid) {
       result->success = false;
       result->error_msg = "No pointcloud data received on lidar 1";
       RCLCPP_INFO(this->get_logger(), "Aborting capture: %s", result->error_msg.c_str());
       goal_handle->abort(result);
       return;
     }
-    if (goal->use_second_lidar && !lidar_2_capture.accumulated_valid) {
+    if (goal->use_second_lidar && !lidar_2_snapshot.accumulated_valid) {
       result->success = false;
       result->error_msg = "No pointcloud data received on lidar 2";
       RCLCPP_INFO(this->get_logger(), "Aborting capture: %s", result->error_msg.c_str());
@@ -560,7 +595,7 @@ private:
     const std::string meta_path = output_dir + "/metadata.txt";
 
     size_t num_pts_lidar_1 = 0;
-    if (!save_cloud_to_pcd(lidar_1_capture.accumulated, lidar_1_pcd_path, num_pts_lidar_1)) {
+    if (!save_cloud_to_pcd(lidar_1_snapshot.accumulated, lidar_1_pcd_path, num_pts_lidar_1)) {
       result->success = false;
       result->error_msg = "Failed to write lidar 1 PCD file";
       RCLCPP_INFO(this->get_logger(), "Aborting capture: %s", result->error_msg.c_str());
@@ -570,9 +605,9 @@ private:
 
     size_t num_pts_lidar_2 = 0;
 
-    sensor_msgs::msg::PointCloud2 merged_cloud = lidar_1_capture.accumulated;
+    sensor_msgs::msg::PointCloud2 merged_cloud = lidar_1_snapshot.accumulated;
     if (goal->use_second_lidar) {
-      if (!has_xyz_fields(lidar_2_capture.accumulated)) {
+      if (!has_xyz_fields(lidar_2_snapshot.accumulated)) {
         result->success = false;
         result->error_msg = "Lidar 2 cloud is missing x/y/z fields required for merging";
         RCLCPP_INFO(this->get_logger(), "Aborting capture: %s", result->error_msg.c_str());
@@ -580,7 +615,7 @@ private:
         return;
       }
 
-      if (!save_cloud_to_pcd(lidar_2_capture.accumulated, lidar_2_pcd_path, num_pts_lidar_2)) {
+      if (!save_cloud_to_pcd(lidar_2_snapshot.accumulated, lidar_2_pcd_path, num_pts_lidar_2)) {
         result->success = false;
         result->error_msg = "Failed to write lidar 2 PCD file";
         RCLCPP_INFO(this->get_logger(), "Aborting capture: %s", result->error_msg.c_str());
@@ -589,7 +624,7 @@ private:
       }
 
       sensor_msgs::msg::PointCloud2 transformed_lidar_2 =
-        transform_cloud_xyz(lidar_2_capture.accumulated, lidar_2_to_1);
+        transform_cloud_xyz(lidar_2_snapshot.accumulated, lidar_2_to_1);
       sensor_msgs::msg::PointCloud2 merged_cloud_out;
       pcl::concatenatePointCloud(merged_cloud, transformed_lidar_2, merged_cloud_out);
       merged_cloud = std::move(merged_cloud_out);
@@ -630,13 +665,13 @@ private:
     // Save gravity (if IMU used)
     double ax = 0.0, ay = 0.0, az = 0.0;
     if (goal->use_imu) {
-      if (!imu_samples.empty()) {
-        for (const auto& s : imu_samples) {
+      if (!imu_samples_snapshot.empty()) {
+        for (const auto& s : imu_samples_snapshot) {
           ax += s.x;
           ay += s.y;
           az += s.z;
         }
-        const double n = static_cast<double>(imu_samples.size());
+        const double n = static_cast<double>(imu_samples_snapshot.size());
         ax /= n;
         ay /= n;
         az /= n;
@@ -675,8 +710,8 @@ private:
         mf << "pc_topic_2:   " << (goal->use_second_lidar ? goal->pc_topic_2 : "") << "\n";
         mf << "dual_lidar:   " << (goal->use_second_lidar ? "true" : "false") << "\n";
         mf << "acc_time_s:   " << goal->acc_time_s << "\n";
-        mf << "clouds_1:     " << lidar_1_capture.cloud_count << "\n";
-        mf << "clouds_2:     " << lidar_2_capture.cloud_count << "\n";
+        mf << "clouds_1:     " << lidar_1_snapshot.cloud_count << "\n";
+        mf << "clouds_2:     " << lidar_2_snapshot.cloud_count << "\n";
         mf << "points_1:     " << num_pts_lidar_1 << "\n";
         mf << "points_2:     " << num_pts_lidar_2 << "\n";
         mf << "num_points:   " << num_pts_merged << "\n";
@@ -689,7 +724,7 @@ private:
         if (goal->use_imu) {
           mf << "imu_topic:    " << goal->imu_topic << "\n";
           mf << "imu_dur_s:    " << goal->imu_dur_s << "\n";
-          mf << "imu_samples:  " << imu_samples.size() << "\n";
+          mf << "imu_samples:  " << imu_samples_snapshot.size() << "\n";
           char gbuf[128];
           std::snprintf(gbuf, sizeof(gbuf), "%.6f %.6f %.6f", ax, ay, az);
           mf << "gravity_mps2: " << gbuf << "\n";
