@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cfloat>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -40,10 +41,17 @@ struct RobotConfig {
   std::chrono::steady_clock::time_point last_announcement_time{};
   
   char pc_topic_buf[256] = "";
+  char pc_topic_2_buf[256] = "";
   char imu_topic_buf[256] = "";
+  char lidar_1_to_2_tf_buf[1024] =
+    "1 0 0 0\n"
+    "0 1 0 0\n"
+    "0 0 1 0\n"
+    "0 0 0 1";
   float acc_time = 1.0f;
   float imu_dur = 1.0f;
   bool use_imu = true;
+  bool use_second_lidar = false;
   
   std::string status_msg;
   float progress = 0.0f;
@@ -89,6 +97,11 @@ private:
       // Auto-select first available topics
       if (!cfg.pc_topics.empty()) {
         std::strncpy(cfg.pc_topic_buf, cfg.pc_topics[0].c_str(), sizeof(cfg.pc_topic_buf) - 1);
+      }
+      if (cfg.pc_topics.size() > 1) {
+        std::strncpy(cfg.pc_topic_2_buf, cfg.pc_topics[1].c_str(), sizeof(cfg.pc_topic_2_buf) - 1);
+      } else if (!cfg.pc_topics.empty()) {
+        std::strncpy(cfg.pc_topic_2_buf, cfg.pc_topics[0].c_str(), sizeof(cfg.pc_topic_2_buf) - 1);
       }
       if (!cfg.imu_topics.empty()) {
         std::strncpy(cfg.imu_topic_buf, cfg.imu_topics[0].c_str(), sizeof(cfg.imu_topic_buf) - 1);
@@ -152,6 +165,12 @@ public:
         continue;
       }
 
+      if (cfg.use_second_lidar && cfg.pc_topic_2_buf[0] == '\0') {
+        cfg.status_msg = "ERROR: No lidar 2 topic selected";
+        add_log("  [" + robot_ns + "] ERROR: No lidar 2 topic selected");
+        continue;
+      }
+
       trigger_capture(robot_ns, cfg);
     }
   }
@@ -170,10 +189,14 @@ private:
 
     auto goal = CapturePcd::Goal();
     goal.pc_topic = std::string(cfg.pc_topic_buf);
+    goal.pc_topic_2 = cfg.use_second_lidar ? std::string(cfg.pc_topic_2_buf) : std::string();
     goal.imu_topic = std::string(cfg.imu_topic_buf);
     goal.acc_time_s = cfg.acc_time;
     goal.imu_dur_s = cfg.imu_dur;
     goal.use_imu = cfg.use_imu;
+    goal.use_second_lidar = cfg.use_second_lidar;
+    goal.lidar_1_to_2_transform =
+      cfg.use_second_lidar ? std::string(cfg.lidar_1_to_2_tf_buf) : std::string();
 
     cfg.capturing = true;
     cfg.progress = 0.0f;
@@ -201,9 +224,9 @@ private:
       [this, robot_ns, &cfg](const GoalHandleCapturePcd::WrappedResult& result) {
         cfg.capturing = false;
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
-          cfg.status_msg = "Done: " + std::to_string(result.result->num_points) + " points";
+          cfg.status_msg = "Done: " + std::to_string(result.result->num_points) + " merged points";
           add_log("  [" + robot_ns + "] SUCCESS: " + std::to_string(result.result->num_points) + 
-                  " points saved to " + result.result->output_dir);
+                  " merged points saved to " + result.result->output_dir);
         } else {
           cfg.status_msg = "FAILED: " + result.result->error_msg;
           add_log("  [" + robot_ns + "] ERROR: " + result.result->error_msg);
@@ -340,9 +363,22 @@ int main(int argc, char** argv) {
             ImGui::BeginDisabled();
           }
           
-          topic_combo("PC topic", ("##pc_" + robot_ns).c_str(),
+          topic_combo("Lidar 1 topic", ("##pc_1_" + robot_ns).c_str(),
                       cfg.pc_topic_buf, sizeof(cfg.pc_topic_buf),
                       cfg.pc_topics);
+
+          ImGui::Checkbox(("Use second lidar##" + robot_ns).c_str(), &cfg.use_second_lidar);
+          if (cfg.use_second_lidar) {
+            topic_combo("Lidar 2 topic", ("##pc_2_" + robot_ns).c_str(),
+                        cfg.pc_topic_2_buf, sizeof(cfg.pc_topic_2_buf),
+                        cfg.pc_topics);
+            ImGui::TextUnformatted("Transform from lidar 1 to lidar 2 (4x4)");
+            ImGui::InputTextMultiline(("##tf_" + robot_ns).c_str(),
+                                      cfg.lidar_1_to_2_tf_buf,
+                                      sizeof(cfg.lidar_1_to_2_tf_buf),
+                                      ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 5.5f));
+            ImGui::TextDisabled("Enter 16 values. Spaces, commas, semicolons, and newlines are accepted.");
+          }
 
           ImGui::Checkbox(("Use IMU##" + robot_ns).c_str(), &cfg.use_imu);
           if (cfg.use_imu) {

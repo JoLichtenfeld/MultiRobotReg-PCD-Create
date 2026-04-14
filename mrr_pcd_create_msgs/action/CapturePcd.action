@@ -1,9 +1,12 @@
 # Goal: request to capture pointcloud from a specific robot
 string pc_topic
+string pc_topic_2
 string imu_topic
 float32 acc_time_s
 float32 imu_dur_s
 bool use_imu
+bool use_second_lidar
+string lidar_1_to_2_transform
 ---
 # Result: returns the captured data info
 string robot_ns
