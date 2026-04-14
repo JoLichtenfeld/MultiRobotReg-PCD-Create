@@ -49,8 +49,12 @@ class SlaveNode : public rclcpp::Node {
 public:
   SlaveNode() : Node("slave_node") {
     // Use robot namespace as robot identity.
-    this->declare_parameter<std::string>("robot_ns", "/robot_0");
-    robot_ns_ = normalize_namespace(this->get_parameter("robot_ns").as_string());
+    this->declare_parameter<std::string>("robot_ns", "");
+    std::string configured_robot_ns = this->get_parameter("robot_ns").as_string();
+    if (configured_robot_ns.empty()) {
+      configured_robot_ns = this->get_namespace();
+    }
+    robot_ns_ = normalize_namespace(configured_robot_ns);
 
     // Publisher for robot announcements
     announcement_pub_ = this->create_publisher<mrr_pcd_create_msgs::msg::RobotAnnouncement>(
