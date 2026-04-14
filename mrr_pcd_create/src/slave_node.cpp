@@ -56,10 +56,12 @@ public:
     announcement_pub_ = this->create_publisher<mrr_pcd_create_msgs::msg::RobotAnnouncement>(
       "/mrr_pcd_announcement", rclcpp::SystemDefaultsQoS());
 
+    capture_action_name_ = (robot_ns_ == "/") ? "/mrr_pcd_capture" : (robot_ns_ + "/mrr_pcd_capture");
+
     // Action server
     action_server_ = rclcpp_action::create_server<CapturePcd>(
       this,
-      "/mrr_pcd_capture",
+      capture_action_name_,
       std::bind(&SlaveNode::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
       std::bind(&SlaveNode::handle_cancel, this, std::placeholders::_1),
       std::bind(&SlaveNode::handle_accepted, this, std::placeholders::_1));
@@ -69,11 +71,13 @@ public:
       std::chrono::seconds(2),
       std::bind(&SlaveNode::publish_announcement, this));
 
-    RCLCPP_INFO(this->get_logger(), "Slave node for namespace '%s' started", robot_ns_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Slave node for namespace '%s' started (capture action: %s)",
+                robot_ns_.c_str(), capture_action_name_.c_str());
   }
 
 private:
   std::string robot_ns_;
+  std::string capture_action_name_;
   rclcpp::Publisher<mrr_pcd_create_msgs::msg::RobotAnnouncement>::SharedPtr announcement_pub_;
   rclcpp_action::Server<CapturePcd>::SharedPtr action_server_;
   rclcpp::TimerBase::SharedPtr announce_timer_;
@@ -252,28 +256,12 @@ private:
   void publish_announcement() {
     auto ann = mrr_pcd_create_msgs::msg::RobotAnnouncement();
     ann.robot_ns = robot_ns_;
+    ann.capture_action_name = capture_action_name_;
 
-    // Discover available topics
+    // Discover available topics visible to this slave.
+    // Do not filter by namespace here: topic namespaces can differ from the
+    // robot identity namespace and would otherwise hide valid lidar/IMU topics.
     for (const auto& [topic, types] : this->get_topic_names_and_types()) {
-      bool belongs_to_robot = topic_in_robot_namespace(topic);
-      if (!belongs_to_robot) {
-        try {
-          const auto publishers = this->get_publishers_info_by_topic(topic);
-          for (const auto & info : publishers) {
-            if (node_namespace_in_robot_namespace(info.node_namespace())) {
-              belongs_to_robot = true;
-              break;
-            }
-          }
-        } catch (const std::exception &) {
-          // Topic might disappear during graph updates; skip it this cycle.
-          continue;
-        }
-      }
-      if (!belongs_to_robot) {
-        continue;
-      }
-
       for (const auto& t : types) {
         if (t == "sensor_msgs/msg/PointCloud2") {
           if (std::find(ann.available_pc_topics.begin(), ann.available_pc_topics.end(), topic) ==
@@ -508,7 +496,6 @@ private:
         break;
       }
 
-      rclcpp::spin_some(this->get_node_base_interface());
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 

@@ -36,6 +36,7 @@ using GoalHandleCapturePcd = rclcpp_action::ClientGoalHandle<CapturePcd>;
 
 struct RobotConfig {
   std::string robot_ns;
+  std::string capture_action_name;
   std::vector<std::string> pc_topics;
   std::vector<std::string> imu_topics;
   std::chrono::steady_clock::time_point last_announcement_time{};
@@ -68,6 +69,9 @@ struct LogEntry {
 class MasterNode : public rclcpp::Node {
 public:
   static constexpr double kInactiveTimeoutSec = 3.0;
+  static std::string default_capture_action_for_robot(const std::string & robot_ns) {
+    return robot_ns == "/" ? "/mrr_pcd_capture" : robot_ns + "/mrr_pcd_capture";
+  }
 
   MasterNode() : Node("mrr_pcd_create_master") {
     // Subscriber to robot announcements
@@ -90,6 +94,8 @@ private:
       // New robot discovered
       RobotConfig cfg;
       cfg.robot_ns = msg->robot_ns;
+      cfg.capture_action_name = msg->capture_action_name.empty() ?
+        default_capture_action_for_robot(msg->robot_ns) : msg->capture_action_name;
       cfg.pc_topics = msg->available_pc_topics;
       cfg.imu_topics = msg->available_imu_topics;
       cfg.last_announcement_time = std::chrono::steady_clock::now();
@@ -109,10 +115,14 @@ private:
       
       robots[msg->robot_ns] = cfg;
       add_log("Discovered robot namespace: " + msg->robot_ns);
-      RCLCPP_INFO(this->get_logger(), "Discovered robot namespace: %s with %zu PC topics and %zu IMU topics",
-                  msg->robot_ns.c_str(), msg->available_pc_topics.size(), msg->available_imu_topics.size());
+      RCLCPP_INFO(this->get_logger(),
+                  "Discovered robot namespace: %s action=%s with %zu PC topics and %zu IMU topics",
+                  msg->robot_ns.c_str(), cfg.capture_action_name.c_str(),
+                  msg->available_pc_topics.size(), msg->available_imu_topics.size());
     } else {
       // Update existing robot's topics
+      it->second.capture_action_name = msg->capture_action_name.empty() ?
+        default_capture_action_for_robot(msg->robot_ns) : msg->capture_action_name;
       it->second.pc_topics = msg->available_pc_topics;
       it->second.imu_topics = msg->available_imu_topics;
       it->second.last_announcement_time = std::chrono::steady_clock::now();
@@ -179,11 +189,14 @@ private:
   void trigger_capture(const std::string& robot_ns, RobotConfig& cfg) {
     // Create action client
     auto action_client = rclcpp_action::create_client<CapturePcd>(
-      this, "/mrr_pcd_capture");
+      this, cfg.capture_action_name);
+
+    add_log("  [" + robot_ns + "] Using action endpoint: " + cfg.capture_action_name);
 
     if (!action_client->wait_for_action_server(std::chrono::seconds(2))) {
       cfg.status_msg = "Server not responding";
-      add_log("  [" + robot_ns + "] ERROR: Action server not responding");
+      add_log("  [" + robot_ns + "] ERROR: Action server not responding at " +
+              cfg.capture_action_name);
       return;
     }
 
