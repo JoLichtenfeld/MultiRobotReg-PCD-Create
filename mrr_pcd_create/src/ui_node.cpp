@@ -71,6 +71,19 @@ struct LogEntry {
   std::string message;
 };
 
+struct CachedRobotSettings {
+  std::string pc_topic;
+  std::string pc_topic_2;
+  std::string imu_topic;
+  std::string sync_host;
+  std::string sync_user;
+  std::string lidar_1_to_2_tf;
+  float acc_time = 1.0f;
+  float imu_dur = 1.0f;
+  bool use_imu = true;
+  bool use_second_lidar = false;
+};
+
 // ─────────────────────────────────────────────────────────────────────────
 
 class MasterNode : public rclcpp::Node {
@@ -81,6 +94,9 @@ public:
   }
 
   MasterNode() : Node("mrr_pcd_create_master") {
+    cache_file_path_ = determine_cache_file_path();
+    load_settings_cache();
+
     // Subscriber to robot announcements
     announcement_sub_ = this->create_subscription<mrr_pcd_create_msgs::msg::RobotAnnouncement>(
       "/mrr_pcd_announcement", rclcpp::SystemDefaultsQoS(),
@@ -93,8 +109,295 @@ public:
   std::vector<LogEntry> log_entries;
   char sync_local_root_buf[256] = "/tmp/mrr_pcd_sync";
 
+  void mark_settings_dirty() {
+    settings_dirty_ = true;
+  }
+
+  void flush_settings_cache_if_dirty() {
+    if (!settings_dirty_) {
+      return;
+    }
+    save_settings_cache();
+  }
+
+  void restore_global_cached_settings() {
+    if (!cached_sync_local_root_.empty()) {
+      copy_string_to_buf(cached_sync_local_root_,
+                         sync_local_root_buf,
+                         sizeof(sync_local_root_buf));
+    }
+  }
+
 private:
   rclcpp::Subscription<mrr_pcd_create_msgs::msg::RobotAnnouncement>::SharedPtr announcement_sub_;
+  std::map<std::string, CachedRobotSettings> cached_robot_settings_;
+  std::filesystem::path cache_file_path_;
+  std::string cached_sync_local_root_;
+  bool settings_dirty_ = false;
+
+  static std::string trim_copy(const std::string & value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+      return std::string();
+    }
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+  }
+
+  static std::string escape_cache_value(const std::string & value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char c : value) {
+      switch (c) {
+        case '\\':
+          escaped += "\\\\";
+          break;
+        case '\n':
+          escaped += "\\n";
+          break;
+        case '\r':
+          escaped += "\\r";
+          break;
+        case '\t':
+          escaped += "\\t";
+          break;
+        default:
+          escaped.push_back(c);
+          break;
+      }
+    }
+    return escaped;
+  }
+
+  static std::string unescape_cache_value(const std::string & value) {
+    std::string unescaped;
+    unescaped.reserve(value.size());
+    bool escaping = false;
+    for (char c : value) {
+      if (!escaping) {
+        if (c == '\\') {
+          escaping = true;
+        } else {
+          unescaped.push_back(c);
+        }
+        continue;
+      }
+
+      switch (c) {
+        case 'n':
+          unescaped.push_back('\n');
+          break;
+        case 'r':
+          unescaped.push_back('\r');
+          break;
+        case 't':
+          unescaped.push_back('\t');
+          break;
+        case '\\':
+          unescaped.push_back('\\');
+          break;
+        default:
+          unescaped.push_back(c);
+          break;
+      }
+      escaping = false;
+    }
+    if (escaping) {
+      unescaped.push_back('\\');
+    }
+    return unescaped;
+  }
+
+  static std::filesystem::path determine_cache_file_path() {
+    const char * xdg_cache_home = std::getenv("XDG_CACHE_HOME");
+    if (xdg_cache_home != nullptr && xdg_cache_home[0] != '\0') {
+      return std::filesystem::path(xdg_cache_home) / "mrr_pcd_create" / "ui_settings.cache";
+    }
+
+    const char * home = std::getenv("HOME");
+    if (home != nullptr && home[0] != '\0') {
+      return std::filesystem::path(home) / ".cache" / "mrr_pcd_create" / "ui_settings.cache";
+    }
+
+    return std::filesystem::temp_directory_path() / "mrr_pcd_create_ui_settings.cache";
+  }
+
+  static void copy_string_to_buf(const std::string & value, char * buf, std::size_t buf_size) {
+    if (buf_size == 0) {
+      return;
+    }
+    std::strncpy(buf, value.c_str(), buf_size - 1);
+    buf[buf_size - 1] = '\0';
+  }
+
+  void cache_settings_for_robot(const RobotConfig & cfg) {
+    CachedRobotSettings & cached = cached_robot_settings_[cfg.robot_ns];
+    cached.pc_topic = cfg.pc_topic_buf;
+    cached.pc_topic_2 = cfg.pc_topic_2_buf;
+    cached.imu_topic = cfg.imu_topic_buf;
+    cached.sync_host = cfg.sync_host_buf;
+    cached.sync_user = cfg.sync_user_buf;
+    cached.lidar_1_to_2_tf = cfg.lidar_1_to_2_tf_buf;
+    cached.acc_time = cfg.acc_time;
+    cached.imu_dur = cfg.imu_dur;
+    cached.use_imu = cfg.use_imu;
+    cached.use_second_lidar = cfg.use_second_lidar;
+  }
+
+  void apply_cached_settings(RobotConfig & cfg) {
+    const auto it = cached_robot_settings_.find(cfg.robot_ns);
+    if (it == cached_robot_settings_.end()) {
+      return;
+    }
+
+    const CachedRobotSettings & cached = it->second;
+    if (!cached.pc_topic.empty()) {
+      copy_string_to_buf(cached.pc_topic, cfg.pc_topic_buf, sizeof(cfg.pc_topic_buf));
+    }
+    if (!cached.pc_topic_2.empty()) {
+      copy_string_to_buf(cached.pc_topic_2, cfg.pc_topic_2_buf, sizeof(cfg.pc_topic_2_buf));
+    }
+    if (!cached.imu_topic.empty()) {
+      copy_string_to_buf(cached.imu_topic, cfg.imu_topic_buf, sizeof(cfg.imu_topic_buf));
+    }
+    if (!cached.sync_host.empty()) {
+      copy_string_to_buf(cached.sync_host, cfg.sync_host_buf, sizeof(cfg.sync_host_buf));
+    }
+    if (!cached.sync_user.empty()) {
+      copy_string_to_buf(cached.sync_user, cfg.sync_user_buf, sizeof(cfg.sync_user_buf));
+    }
+    if (!cached.lidar_1_to_2_tf.empty()) {
+      copy_string_to_buf(cached.lidar_1_to_2_tf,
+                         cfg.lidar_1_to_2_tf_buf,
+                         sizeof(cfg.lidar_1_to_2_tf_buf));
+    }
+    cfg.acc_time = cached.acc_time;
+    cfg.imu_dur = cached.imu_dur;
+    cfg.use_imu = cached.use_imu;
+    cfg.use_second_lidar = cached.use_second_lidar;
+  }
+
+  void load_settings_cache() {
+    cached_robot_settings_.clear();
+    cached_sync_local_root_.clear();
+
+    std::ifstream in(cache_file_path_);
+    if (!in.is_open()) {
+      return;
+    }
+
+    std::string line;
+    std::string current_robot;
+    while (std::getline(in, line)) {
+      line = trim_copy(line);
+      if (line.empty() || line.front() == '#') {
+        continue;
+      }
+
+      if (line.rfind("robot=", 0) == 0) {
+        current_robot = unescape_cache_value(line.substr(6));
+        if (!current_robot.empty()) {
+          cached_robot_settings_[current_robot];
+        }
+        continue;
+      }
+
+      if (line == "---") {
+        current_robot.clear();
+        continue;
+      }
+
+      const std::size_t sep = line.find('=');
+      if (sep == std::string::npos) {
+        continue;
+      }
+
+      const std::string key = trim_copy(line.substr(0, sep));
+      const std::string value = unescape_cache_value(line.substr(sep + 1));
+
+      if (current_robot.empty()) {
+        if (key == "sync_local_root") {
+          cached_sync_local_root_ = value;
+        }
+        continue;
+      }
+
+      CachedRobotSettings & cached = cached_robot_settings_[current_robot];
+
+      if (key == "pc_topic") {
+        cached.pc_topic = value;
+      } else if (key == "pc_topic_2") {
+        cached.pc_topic_2 = value;
+      } else if (key == "imu_topic") {
+        cached.imu_topic = value;
+      } else if (key == "sync_host") {
+        cached.sync_host = value;
+      } else if (key == "sync_user") {
+        cached.sync_user = value;
+      } else if (key == "lidar_1_to_2_tf") {
+        cached.lidar_1_to_2_tf = value;
+      } else if (key == "acc_time") {
+        cached.acc_time = std::strtof(value.c_str(), nullptr);
+      } else if (key == "imu_dur") {
+        cached.imu_dur = std::strtof(value.c_str(), nullptr);
+      } else if (key == "use_imu") {
+        cached.use_imu = (value == "1" || value == "true");
+      } else if (key == "use_second_lidar") {
+        cached.use_second_lidar = (value == "1" || value == "true");
+      }
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Loaded UI settings cache from %s",
+                cache_file_path_.string().c_str());
+  }
+
+  void save_settings_cache() {
+    cached_sync_local_root_ = sync_local_root_buf;
+    for (const auto & [_, cfg] : robots) {
+      cache_settings_for_robot(cfg);
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(cache_file_path_.parent_path(), ec);
+    if (ec) {
+      RCLCPP_WARN(this->get_logger(), "Failed to create cache directory %s: %s",
+                  cache_file_path_.parent_path().string().c_str(), ec.message().c_str());
+      return;
+    }
+
+    std::ofstream out(cache_file_path_, std::ios::trunc);
+    if (!out.is_open()) {
+      RCLCPP_WARN(this->get_logger(), "Failed to open settings cache file %s for writing",
+                  cache_file_path_.string().c_str());
+      return;
+    }
+
+    out << "# mrr_pcd_create UI settings cache\n";
+    out << "sync_local_root=" << escape_cache_value(cached_sync_local_root_) << "\n";
+    for (const auto & [robot_ns, cached] : cached_robot_settings_) {
+      out << "robot=" << escape_cache_value(robot_ns) << "\n";
+      out << "pc_topic=" << escape_cache_value(cached.pc_topic) << "\n";
+      out << "pc_topic_2=" << escape_cache_value(cached.pc_topic_2) << "\n";
+      out << "imu_topic=" << escape_cache_value(cached.imu_topic) << "\n";
+      out << "sync_host=" << escape_cache_value(cached.sync_host) << "\n";
+      out << "sync_user=" << escape_cache_value(cached.sync_user) << "\n";
+      out << "lidar_1_to_2_tf=" << escape_cache_value(cached.lidar_1_to_2_tf) << "\n";
+      out << std::fixed << std::setprecision(6);
+      out << "acc_time=" << cached.acc_time << "\n";
+      out << "imu_dur=" << cached.imu_dur << "\n";
+      out << "use_imu=" << (cached.use_imu ? "1" : "0") << "\n";
+      out << "use_second_lidar=" << (cached.use_second_lidar ? "1" : "0") << "\n";
+      out << "---\n";
+    }
+
+    if (!out.good()) {
+      RCLCPP_WARN(this->get_logger(), "Failed while writing settings cache file %s",
+                  cache_file_path_.string().c_str());
+      return;
+    }
+
+    settings_dirty_ = false;
+  }
 
   static std::string robot_ns_to_host_hint(const std::string & robot_ns) {
     std::string key = robot_ns;
@@ -149,6 +452,7 @@ private:
       if (!cfg.imu_topics.empty()) {
         std::strncpy(cfg.imu_topic_buf, cfg.imu_topics[0].c_str(), sizeof(cfg.imu_topic_buf) - 1);
       }
+      apply_cached_settings(cfg);
       
       robots[msg->robot_ns] = cfg;
       add_log("Discovered robot namespace: " + msg->robot_ns);
@@ -372,7 +676,7 @@ private:
 
 // ─────────────────────────────────────────────────────────────────────────
 
-static void topic_combo(const char* label,
+static bool topic_combo(const char* label,
                         const char* popup_id,
                         char* buf,
                         std::size_t buf_size,
@@ -380,12 +684,13 @@ static void topic_combo(const char* label,
   const float btn_w = ImGui::GetFrameHeight();
   const float inner = ImGui::GetStyle().ItemInnerSpacing.x;
   const float field_w = ImGui::CalcItemWidth() - btn_w - inner;
+  bool changed = false;
 
   const ImVec2 field_pos = ImGui::GetCursorScreenPos();
 
   ImGui::SetNextItemWidth(field_w);
   std::string input_id = std::string("##input_") + popup_id;
-  ImGui::InputText(input_id.c_str(), buf, buf_size);
+  changed = ImGui::InputText(input_id.c_str(), buf, buf_size) || changed;
   ImGui::SameLine(0.0f, inner);
   std::string btn_id = std::string("##btn_") + popup_id;
   if (ImGui::ArrowButton(btn_id.c_str(), ImGuiDir_Down)) {
@@ -405,12 +710,15 @@ static void topic_combo(const char* label,
       if (ImGui::Selectable(t.c_str())) {
         std::strncpy(buf, t.c_str(), buf_size - 1);
         buf[buf_size - 1] = '\0';
+        changed = true;
       }
     }
     if (!any)
       ImGui::TextDisabled(topics.empty() ? "(no topics discovered yet)" : "(no match)");
     ImGui::EndPopup();
   }
+
+  return changed;
 }
 
 static void glfw_error_cb(int, const char* desc) {
@@ -420,6 +728,7 @@ static void glfw_error_cb(int, const char* desc) {
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<MasterNode>();
+  node->restore_global_cached_settings();
 
   glfwSetErrorCallback(glfw_error_cb);
   if (!glfwInit()) return 1;
@@ -476,6 +785,7 @@ int main(int argc, char** argv) {
         ImGui::PushID(robot_idx);
         const bool active = node->is_active(cfg);
         const double inactive_s = node->seconds_since_last_announcement(cfg);
+        bool robot_settings_changed = false;
         
         // Robot header
         if (ImGui::CollapsingHeader(("Robot NS: " + robot_ns).c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -492,37 +802,50 @@ int main(int argc, char** argv) {
             ImGui::BeginDisabled();
           }
           
-          topic_combo("Lidar 1 topic", ("##pc_1_" + robot_ns).c_str(),
-                      cfg.pc_topic_buf, sizeof(cfg.pc_topic_buf),
-                      cfg.pc_topics);
+          robot_settings_changed =
+            topic_combo("Lidar 1 topic", ("##pc_1_" + robot_ns).c_str(),
+                        cfg.pc_topic_buf, sizeof(cfg.pc_topic_buf),
+                        cfg.pc_topics) || robot_settings_changed;
 
-          ImGui::Checkbox(("Use second lidar##" + robot_ns).c_str(), &cfg.use_second_lidar);
+          robot_settings_changed =
+            ImGui::Checkbox(("Use second lidar##" + robot_ns).c_str(), &cfg.use_second_lidar) ||
+            robot_settings_changed;
           if (cfg.use_second_lidar) {
-            topic_combo("Lidar 2 topic", ("##pc_2_" + robot_ns).c_str(),
-                        cfg.pc_topic_2_buf, sizeof(cfg.pc_topic_2_buf),
-                        cfg.pc_topics);
+            robot_settings_changed =
+              topic_combo("Lidar 2 topic", ("##pc_2_" + robot_ns).c_str(),
+                          cfg.pc_topic_2_buf, sizeof(cfg.pc_topic_2_buf),
+                          cfg.pc_topics) || robot_settings_changed;
             ImGui::TextUnformatted("Transform from lidar 1 to lidar 2 (4x4)");
-            ImGui::InputTextMultiline(("##tf_" + robot_ns).c_str(),
-                                      cfg.lidar_1_to_2_tf_buf,
-                                      sizeof(cfg.lidar_1_to_2_tf_buf),
-                                      ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 5.5f));
+            robot_settings_changed =
+              ImGui::InputTextMultiline(("##tf_" + robot_ns).c_str(),
+                                        cfg.lidar_1_to_2_tf_buf,
+                                        sizeof(cfg.lidar_1_to_2_tf_buf),
+                                        ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 5.5f)) ||
+              robot_settings_changed;
             ImGui::TextDisabled("Enter 16 values. Spaces, commas, semicolons, and newlines are accepted.");
           }
 
-          ImGui::Checkbox(("Use IMU##" + robot_ns).c_str(), &cfg.use_imu);
+          robot_settings_changed =
+            ImGui::Checkbox(("Use IMU##" + robot_ns).c_str(), &cfg.use_imu) ||
+            robot_settings_changed;
           if (cfg.use_imu) {
             ImGui::SameLine();
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-            topic_combo("IMU topic", ("##imu_" + robot_ns).c_str(),
-                        cfg.imu_topic_buf, sizeof(cfg.imu_topic_buf),
-                        cfg.imu_topics);
+            robot_settings_changed =
+              topic_combo("IMU topic", ("##imu_" + robot_ns).c_str(),
+                          cfg.imu_topic_buf, sizeof(cfg.imu_topic_buf),
+                          cfg.imu_topics) || robot_settings_changed;
           }
 
-          ImGui::InputFloat(("Acc. time (s)##" + robot_ns).c_str(), &cfg.acc_time, 0.5f, 1.0f, "%.1f");
+          robot_settings_changed =
+            ImGui::InputFloat(("Acc. time (s)##" + robot_ns).c_str(), &cfg.acc_time, 0.5f, 1.0f, "%.1f") ||
+            robot_settings_changed;
           if (cfg.acc_time < 0.0f) cfg.acc_time = 0.0f;
 
           if (cfg.use_imu) {
-            ImGui::InputFloat(("IMU duration (s)##" + robot_ns).c_str(), &cfg.imu_dur, 0.5f, 1.0f, "%.1f");
+            robot_settings_changed =
+              ImGui::InputFloat(("IMU duration (s)##" + robot_ns).c_str(), &cfg.imu_dur, 0.5f, 1.0f, "%.1f") ||
+              robot_settings_changed;
             if (cfg.imu_dur < 0.1f) cfg.imu_dur = 0.1f;
           }
 
@@ -541,10 +864,14 @@ int main(int argc, char** argv) {
             ImGui::TextWrapped("Last output: %s", cfg.last_output_dir.c_str());
           }
 
-          ImGui::InputText(("Sync host##" + robot_ns).c_str(),
-                           cfg.sync_host_buf, sizeof(cfg.sync_host_buf));
-          ImGui::InputText(("Sync user (optional)##" + robot_ns).c_str(),
-                           cfg.sync_user_buf, sizeof(cfg.sync_user_buf));
+          robot_settings_changed =
+            ImGui::InputText(("Sync host##" + robot_ns).c_str(),
+                             cfg.sync_host_buf, sizeof(cfg.sync_host_buf)) ||
+            robot_settings_changed;
+          robot_settings_changed =
+            ImGui::InputText(("Sync user (optional)##" + robot_ns).c_str(),
+                             cfg.sync_user_buf, sizeof(cfg.sync_user_buf)) ||
+            robot_settings_changed;
 
           if (cfg.capturing || cfg.last_output_dir.empty()) {
             ImGui::BeginDisabled();
@@ -558,6 +885,10 @@ int main(int argc, char** argv) {
 
           if (!active) {
             ImGui::EndDisabled();
+          }
+
+          if (robot_settings_changed) {
+            node->mark_settings_dirty();
           }
 
           ImGui::Unindent();
@@ -598,7 +929,9 @@ int main(int argc, char** argv) {
     }
     if (any_capturing || !any_active) ImGui::EndDisabled();
 
-    ImGui::InputText("Sync local root", node->sync_local_root_buf, sizeof(node->sync_local_root_buf));
+    if (ImGui::InputText("Sync local root", node->sync_local_root_buf, sizeof(node->sync_local_root_buf))) {
+      node->mark_settings_dirty();
+    }
     if (any_capturing) ImGui::BeginDisabled();
     if (ImGui::Button("COPY/SYNC ALL", button_size)) {
       node->sync_all_last_outputs();
@@ -635,6 +968,8 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     glfwSwapBuffers(win);
+
+    node->flush_settings_cache_if_dirty();
   }
 
   ImGui_ImplOpenGL3_Shutdown();
