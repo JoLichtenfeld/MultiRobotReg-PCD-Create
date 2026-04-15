@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cfloat>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -27,7 +28,7 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
-#include "mrr_pcd_create_msgs/msg/robot_announcement.hpp"
+#include "hector_multi_robot_msgs/msg/robot_announcement.hpp"
 #include "mrr_pcd_create_msgs/action/capture_pcd.hpp"
 
 using CapturePcd = mrr_pcd_create_msgs::action::CapturePcd;
@@ -37,12 +38,15 @@ using GoalHandleCapturePcd = rclcpp_action::ClientGoalHandle<CapturePcd>;
 
 struct RobotConfig {
   std::string robot_ns;
+  std::string robot_id;
+  std::string display_name;
   std::string capture_action_name;
   rclcpp_action::Client<CapturePcd>::SharedPtr action_client;
   std::vector<std::string> pc_topics;
   std::vector<std::string> imu_topics;
   std::chrono::steady_clock::time_point last_announcement_time{};
   std::string last_output_dir;
+  bool action_server_available = false;
   
   char pc_topic_buf[256] = "";
   char pc_topic_2_buf[256] = "";
@@ -97,10 +101,15 @@ public:
     cache_file_path_ = determine_cache_file_path();
     load_settings_cache();
 
-    // Subscriber to robot announcements
-    announcement_sub_ = this->create_subscription<mrr_pcd_create_msgs::msg::RobotAnnouncement>(
-      "/mrr_pcd_announcement", rclcpp::SystemDefaultsQoS(),
+    // Subscribe to the system-wide robot announcement topic
+    announcement_sub_ = this->create_subscription<hector_multi_robot_msgs::msg::RobotAnnouncement>(
+      "/robot_announcement", rclcpp::SystemDefaultsQoS(),
       std::bind(&MasterNode::on_announcement, this, std::placeholders::_1));
+
+    // Periodically refresh the topic lists for all known robots from the master's own view
+    topic_refresh_timer_ = this->create_wall_timer(
+      std::chrono::seconds(2),
+      std::bind(&MasterNode::refresh_robot_topics, this));
 
     RCLCPP_INFO(this->get_logger(), "Master node started, listening for robots...");
   }
@@ -129,7 +138,8 @@ public:
   }
 
 private:
-  rclcpp::Subscription<mrr_pcd_create_msgs::msg::RobotAnnouncement>::SharedPtr announcement_sub_;
+  rclcpp::Subscription<hector_multi_robot_msgs::msg::RobotAnnouncement>::SharedPtr announcement_sub_;
+  rclcpp::TimerBase::SharedPtr topic_refresh_timer_;
   std::map<std::string, CachedRobotSettings> cached_robot_settings_;
   std::filesystem::path cache_file_path_;
   std::string cached_sync_local_root_;
@@ -228,6 +238,63 @@ private:
     }
     std::strncpy(buf, value.c_str(), buf_size - 1);
     buf[buf_size - 1] = '\0';
+  }
+
+  // ── Topic-type helpers ───────────────────────────────────────────────
+  static bool type_name_has_suffix(const std::string & type_name, const std::string & suffix) {
+    if (type_name.size() < suffix.size()) return false;
+    return type_name.compare(type_name.size() - suffix.size(), suffix.size(), suffix) == 0;
+  }
+  static bool is_pointcloud2_type(const std::string & t) {
+    return t == "sensor_msgs/msg/PointCloud2" || type_name_has_suffix(t, "/PointCloud2");
+  }
+  static bool is_imu_type(const std::string & t) {
+    return t == "sensor_msgs/msg/Imu" || type_name_has_suffix(t, "/Imu");
+  }
+
+  static bool topic_in_namespace(const std::string & topic, const std::string & ns) {
+    if (ns == "/") return !topic.empty() && topic.front() == '/';
+    if (topic.rfind(ns, 0) != 0) return false;
+    return topic.size() == ns.size() || topic[ns.size()] == '/';
+  }
+
+  // Scan all topics visible to the master and bucket them per known robot.
+  void refresh_robot_topics() {
+    const auto all_topics = this->get_topic_names_and_types();
+    for (auto & [robot_ns, cfg] : robots) {
+      std::vector<std::string> pc_topics;
+      std::vector<std::string> imu_topics;
+      for (const auto & [topic, types] : all_topics) {
+        if (!topic_in_namespace(topic, robot_ns)) continue;
+        for (const auto & t : types) {
+          if (is_pointcloud2_type(t)) {
+            if (std::find(pc_topics.begin(), pc_topics.end(), topic) == pc_topics.end())
+              pc_topics.push_back(topic);
+          }
+          if (is_imu_type(t)) {
+            if (std::find(imu_topics.begin(), imu_topics.end(), topic) == imu_topics.end())
+              imu_topics.push_back(topic);
+          }
+        }
+      }
+      std::sort(pc_topics.begin(), pc_topics.end());
+      std::sort(imu_topics.begin(), imu_topics.end());
+      cfg.pc_topics  = std::move(pc_topics);
+      cfg.imu_topics = std::move(imu_topics);
+
+      if (!cfg.action_client) {
+        cfg.action_client = rclcpp_action::create_client<CapturePcd>(this, cfg.capture_action_name);
+      }
+      const bool was_action_server_available = cfg.action_server_available;
+      cfg.action_server_available = cfg.action_client->wait_for_action_server(std::chrono::seconds(0));
+      if (cfg.action_server_available != was_action_server_available) {
+        if (cfg.action_server_available) {
+          add_log("  [" + robot_ns + "] Action server available");
+        } else {
+          add_log("  [" + robot_ns + "] Action server unavailable");
+        }
+      }
+    }
   }
 
   void cache_settings_for_robot(const RobotConfig & cfg) {
@@ -426,61 +493,78 @@ private:
     return out;
   }
 
-  void on_announcement(const mrr_pcd_create_msgs::msg::RobotAnnouncement::SharedPtr msg) {
-    auto it = robots.find(msg->robot_ns);
+  void on_announcement(const hector_multi_robot_msgs::msg::RobotAnnouncement::SharedPtr msg) {
+    const std::string & robot_ns = msg->ros_namespace.empty() ? "/" : msg->ros_namespace;
+    auto it = robots.find(robot_ns);
     if (it == robots.end()) {
       // New robot discovered
       RobotConfig cfg;
-      cfg.robot_ns = msg->robot_ns;
-      cfg.capture_action_name = msg->capture_action_name.empty() ?
-        default_capture_action_for_robot(msg->robot_ns) : msg->capture_action_name;
-      cfg.pc_topics = msg->available_pc_topics;
-      cfg.imu_topics = msg->available_imu_topics;
+      cfg.robot_ns        = robot_ns;
+      cfg.robot_id        = msg->id;
+      cfg.display_name    = msg->name.empty() ? msg->id : msg->name;
+      cfg.capture_action_name = default_capture_action_for_robot(robot_ns);
       cfg.last_announcement_time = std::chrono::steady_clock::now();
-      const std::string host_hint = robot_ns_to_host_hint(msg->robot_ns);
+      cfg.action_client = rclcpp_action::create_client<CapturePcd>(this, cfg.capture_action_name);
+      cfg.action_server_available = cfg.action_client->wait_for_action_server(std::chrono::seconds(0));
+      const std::string host_hint = robot_ns_to_host_hint(robot_ns);
       std::strncpy(cfg.sync_host_buf, host_hint.c_str(), sizeof(cfg.sync_host_buf) - 1);
-      
-      // Auto-select first available topics
-      if (!cfg.pc_topics.empty()) {
-        std::strncpy(cfg.pc_topic_buf, cfg.pc_topics[0].c_str(), sizeof(cfg.pc_topic_buf) - 1);
+
+      // Seed topic lists immediately from the master's own view
+      const auto all_topics = this->get_topic_names_and_types();
+      for (const auto & [topic, types] : all_topics) {
+        if (!topic_in_namespace(topic, robot_ns)) continue;
+        for (const auto & t : types) {
+          if (is_pointcloud2_type(t) &&
+              std::find(cfg.pc_topics.begin(), cfg.pc_topics.end(), topic) == cfg.pc_topics.end())
+            cfg.pc_topics.push_back(topic);
+          if (is_imu_type(t) &&
+              std::find(cfg.imu_topics.begin(), cfg.imu_topics.end(), topic) == cfg.imu_topics.end())
+            cfg.imu_topics.push_back(topic);
+        }
       }
-      if (cfg.pc_topics.size() > 1) {
+      std::sort(cfg.pc_topics.begin(),  cfg.pc_topics.end());
+      std::sort(cfg.imu_topics.begin(), cfg.imu_topics.end());
+
+      // Auto-select first available topics (may be overridden by cache below)
+      if (!cfg.pc_topics.empty())
+        std::strncpy(cfg.pc_topic_buf,   cfg.pc_topics[0].c_str(), sizeof(cfg.pc_topic_buf)   - 1);
+      if (cfg.pc_topics.size() > 1)
         std::strncpy(cfg.pc_topic_2_buf, cfg.pc_topics[1].c_str(), sizeof(cfg.pc_topic_2_buf) - 1);
-      } else if (!cfg.pc_topics.empty()) {
+      else if (!cfg.pc_topics.empty())
         std::strncpy(cfg.pc_topic_2_buf, cfg.pc_topics[0].c_str(), sizeof(cfg.pc_topic_2_buf) - 1);
-      }
-      if (!cfg.imu_topics.empty()) {
-        std::strncpy(cfg.imu_topic_buf, cfg.imu_topics[0].c_str(), sizeof(cfg.imu_topic_buf) - 1);
-      }
+      if (!cfg.imu_topics.empty())
+        std::strncpy(cfg.imu_topic_buf,  cfg.imu_topics[0].c_str(), sizeof(cfg.imu_topic_buf)  - 1);
+
       apply_cached_settings(cfg);
-      
-      robots[msg->robot_ns] = cfg;
-      add_log("Discovered robot namespace: " + msg->robot_ns);
-      RCLCPP_INFO(this->get_logger(),
-                  "Discovered robot namespace: %s action=%s with %zu PC topics and %zu IMU topics",
-                  msg->robot_ns.c_str(), cfg.capture_action_name.c_str(),
-                  msg->available_pc_topics.size(), msg->available_imu_topics.size());
+
+      robots[robot_ns] = cfg;
+      add_log("Discovered robot: " + cfg.display_name + "  ns=" + robot_ns);
+      RCLCPP_INFO(this->get_logger(), "Discovered robot '%s' (ns=%s, action=%s)",
+                  cfg.display_name.c_str(), robot_ns.c_str(), cfg.capture_action_name.c_str());
     } else {
-      // Update existing robot's topics
-      it->second.capture_action_name = msg->capture_action_name.empty() ?
-        default_capture_action_for_robot(msg->robot_ns) : msg->capture_action_name;
-      it->second.pc_topics = msg->available_pc_topics;
-      it->second.imu_topics = msg->available_imu_topics;
+      // Refresh liveness stamp; topic lists are kept up-to-date by refresh_robot_topics()
       it->second.last_announcement_time = std::chrono::steady_clock::now();
+      // Update human-readable name in case it changed
+      if (!msg->name.empty()) it->second.display_name = msg->name;
     }
   }
 
 public:
-  bool is_active(const RobotConfig & cfg) const {
+  bool has_recent_announcement(const RobotConfig & cfg) const {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
       std::chrono::duration<double>(now - cfg.last_announcement_time).count();
     return elapsed <= kInactiveTimeoutSec;
   }
 
-  double seconds_since_last_announcement(const RobotConfig & cfg) const {
+  bool is_active(const RobotConfig & cfg) const {
+    return has_recent_announcement(cfg) && cfg.action_server_available;
+  }
+
+  int seconds_since_last_announcement(const RobotConfig & cfg) const {
     const auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration<double>(now - cfg.last_announcement_time).count();
+    const double seconds = std::chrono::duration<double>(now - cfg.last_announcement_time).count();
+    return static_cast<int>(std::ceil(std::max(0.0, seconds)));
   }
 
   void add_log(const std::string& msg) {
@@ -505,8 +589,13 @@ public:
 
     for (auto& [robot_ns, cfg] : robots) {
       if (!is_active(cfg)) {
-        cfg.status_msg = "INACTIVE: no announcement for >3s";
-        add_log("  [" + robot_ns + "] SKIPPED: inactive (>3s without announcement)");
+        if (!has_recent_announcement(cfg)) {
+          cfg.status_msg = "INACTIVE: announcement timeout";
+          add_log("  [" + robot_ns + "] SKIPPED: inactive (announcement timeout)");
+        } else {
+          cfg.status_msg = "INACTIVE: action server unavailable";
+          add_log("  [" + robot_ns + "] SKIPPED: inactive (action server unavailable)");
+        }
         continue;
       }
 
@@ -592,9 +681,10 @@ public:
 
 private:
   void trigger_capture(const std::string& robot_ns, RobotConfig& cfg) {
-    // Create action client
-    cfg.action_client = rclcpp_action::create_client<CapturePcd>(
-      this, cfg.capture_action_name);
+    if (!cfg.action_client) {
+      cfg.action_client = rclcpp_action::create_client<CapturePcd>(
+        this, cfg.capture_action_name);
+    }
     auto action_client = cfg.action_client;
 
     add_log("  [" + robot_ns + "] Using action endpoint: " + cfg.capture_action_name);
@@ -748,7 +838,41 @@ int main(int argc, char** argv) {
   ImGui::CreateContext();
   ImGui_ImplGlfw_InitForOpenGL(win, true);
   ImGui_ImplOpenGL3_Init("#version 330");
+
+  // ── Style ──────────────────────────────────────────────────────────────
   ImGui::StyleColorsDark();
+  ImGuiStyle & style = ImGui::GetStyle();
+  style.WindowPadding    = ImVec2(12.0f, 10.0f);
+  style.FramePadding     = ImVec2(8.0f, 4.0f);
+  style.ItemSpacing      = ImVec2(8.0f, 6.0f);
+  style.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
+  style.WindowRounding   = 6.0f;
+  style.FrameRounding    = 4.0f;
+  style.GrabRounding     = 4.0f;
+  style.PopupRounding    = 4.0f;
+  style.ScrollbarRounding = 4.0f;
+  style.TabRounding      = 4.0f;
+  style.IndentSpacing    = 16.0f;
+  // Slightly softer dark palette
+  ImVec4 * colors = style.Colors;
+  colors[ImGuiCol_WindowBg]        = ImVec4(0.13f, 0.14f, 0.15f, 1.00f);
+  colors[ImGuiCol_ChildBg]         = ImVec4(0.10f, 0.11f, 0.12f, 1.00f);
+  colors[ImGuiCol_FrameBg]         = ImVec4(0.20f, 0.21f, 0.22f, 1.00f);
+  colors[ImGuiCol_FrameBgHovered]  = ImVec4(0.28f, 0.29f, 0.30f, 1.00f);
+  colors[ImGuiCol_FrameBgActive]   = ImVec4(0.24f, 0.25f, 0.26f, 1.00f);
+  colors[ImGuiCol_TitleBgActive]   = ImVec4(0.16f, 0.17f, 0.18f, 1.00f);
+  colors[ImGuiCol_Header]          = ImVec4(0.22f, 0.23f, 0.25f, 1.00f);
+  colors[ImGuiCol_HeaderHovered]   = ImVec4(0.30f, 0.31f, 0.33f, 1.00f);
+  colors[ImGuiCol_HeaderActive]    = ImVec4(0.26f, 0.27f, 0.29f, 1.00f);
+  colors[ImGuiCol_Button]          = ImVec4(0.26f, 0.28f, 0.32f, 1.00f);
+  colors[ImGuiCol_ButtonHovered]   = ImVec4(0.34f, 0.36f, 0.40f, 1.00f);
+  colors[ImGuiCol_ButtonActive]    = ImVec4(0.20f, 0.22f, 0.26f, 1.00f);
+  colors[ImGuiCol_CheckMark]       = ImVec4(0.26f, 0.78f, 0.35f, 1.00f);
+  colors[ImGuiCol_SliderGrab]      = ImVec4(0.36f, 0.60f, 0.80f, 1.00f);
+  colors[ImGuiCol_Separator]       = ImVec4(0.30f, 0.31f, 0.33f, 1.00f);
+  colors[ImGuiCol_Tab]             = ImVec4(0.18f, 0.19f, 0.21f, 1.00f);
+  colors[ImGuiCol_TabHovered]      = ImVec4(0.30f, 0.32f, 0.36f, 1.00f);
+  colors[ImGuiCol_TabSelected]     = ImVec4(0.24f, 0.26f, 0.30f, 1.00f);
 
   while (!glfwWindowShouldClose(win)) {
     glfwPollEvents();
@@ -784,19 +908,34 @@ int main(int argc, char** argv) {
       for (auto& [robot_ns, cfg] : node->robots) {
         ImGui::PushID(robot_idx);
         const bool active = node->is_active(cfg);
-        const double inactive_s = node->seconds_since_last_announcement(cfg);
+        const int inactive_s = node->seconds_since_last_announcement(cfg);
+        const bool timed_out = !node->has_recent_announcement(cfg);
         bool robot_settings_changed = false;
         
         // Robot header
-        if (ImGui::CollapsingHeader(("Robot NS: " + robot_ns).c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+        const ImVec4 header_col = active
+          ? ImVec4(0.20f, 0.55f, 0.25f, 1.0f)
+          : ImVec4(0.55f, 0.20f, 0.20f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Header,        header_col);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(header_col.x + 0.08f, header_col.y + 0.08f, header_col.z + 0.08f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(header_col.x - 0.04f, header_col.y - 0.04f, header_col.z - 0.04f, 1.0f));
+        const bool robot_open = ImGui::CollapsingHeader(("  " + cfg.display_name + "  (" + robot_ns + ")").c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::PopStyleColor(3);
+        if (robot_open) {
           ImGui::Indent();
 
           if (active) {
-            ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.35f, 1.0f), "State: ACTIVE");
+            ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.35f, 1.0f), "● ACTIVE");
           } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
-                               "State: INACTIVE (last seen %.1f s ago)", inactive_s);
+            if (timed_out) {
+              ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                                 "● INACTIVE  (last seen %ds ago)", inactive_s);
+            } else {
+              ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                                 "● INACTIVE  (action server unavailable)");
+            }
           }
+          ImGui::Spacing();
 
           if (!active) {
             ImGui::BeginDisabled();
@@ -837,12 +976,16 @@ int main(int argc, char** argv) {
                           cfg.imu_topics) || robot_settings_changed;
           }
 
+          // Timings: side-by-side
+          ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
           robot_settings_changed =
             ImGui::InputFloat(("Acc. time (s)##" + robot_ns).c_str(), &cfg.acc_time, 0.5f, 1.0f, "%.1f") ||
             robot_settings_changed;
           if (cfg.acc_time < 0.0f) cfg.acc_time = 0.0f;
 
           if (cfg.use_imu) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
             robot_settings_changed =
               ImGui::InputFloat(("IMU duration (s)##" + robot_ns).c_str(), &cfg.imu_dur, 0.5f, 1.0f, "%.1f") ||
               robot_settings_changed;
@@ -864,19 +1007,29 @@ int main(int argc, char** argv) {
             ImGui::TextWrapped("Last output: %s", cfg.last_output_dir.c_str());
           }
 
+          ImGui::Spacing();
+          ImGui::Separator();
+          ImGui::Spacing();
+          // Sync fields: host + user side-by-side, then button
+          const float sync_btn_w = 160.0f;
+          const float sync_fields_w = ImGui::GetContentRegionAvail().x - sync_btn_w
+                                      - ImGui::GetStyle().ItemSpacing.x;
+          ImGui::SetNextItemWidth(sync_fields_w * 0.6f);
           robot_settings_changed =
             ImGui::InputText(("Sync host##" + robot_ns).c_str(),
                              cfg.sync_host_buf, sizeof(cfg.sync_host_buf)) ||
             robot_settings_changed;
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(sync_fields_w * 0.4f);
           robot_settings_changed =
-            ImGui::InputText(("Sync user (optional)##" + robot_ns).c_str(),
+            ImGui::InputText(("Sync user##" + robot_ns).c_str(),
                              cfg.sync_user_buf, sizeof(cfg.sync_user_buf)) ||
             robot_settings_changed;
-
+          ImGui::SameLine();
           if (cfg.capturing || cfg.last_output_dir.empty()) {
             ImGui::BeginDisabled();
           }
-          if (ImGui::Button(("Copy/Sync Last Dump##" + robot_ns).c_str())) {
+          if (ImGui::Button(("⇄  Sync dump##" + robot_ns).c_str(), ImVec2(sync_btn_w, 0.0f))) {
             node->sync_robot_last_output(robot_ns, cfg);
           }
           if (cfg.capturing || cfg.last_output_dir.empty()) {
@@ -891,6 +1044,7 @@ int main(int argc, char** argv) {
             node->mark_settings_dirty();
           }
 
+          ImGui::Spacing();
           ImGui::Unindent();
         }
 
@@ -899,47 +1053,60 @@ int main(int argc, char** argv) {
       }
     }
 
+    ImGui::Spacing();
     ImGui::Separator();
+    ImGui::Spacing();
 
-    // ── Big green capture button ────────────────────────────────────────
-    ImVec2 button_size(ImGui::GetContentRegionAvail().x, 50.0f);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.8f, 0.2f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.0f, 1.0f, 0.3f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.6f, 0.15f, 1.0f));
-
+    // ── Action bar ──────────────────────────────────────────────────────
     bool any_capturing = false;
     for (auto& [_, cfg] : node->robots) {
-      if (cfg.capturing) {
-        any_capturing = true;
-        break;
-      }
+      if (cfg.capturing) { any_capturing = true; break; }
     }
-
     bool any_active = false;
     for (const auto& [_, cfg] : node->robots) {
-      if (node->is_active(cfg)) {
-        any_active = true;
-        break;
-      }
+      if (node->is_active(cfg)) { any_active = true; break; }
     }
 
+    constexpr float kActionBtnW = 160.0f;
+    constexpr float kActionBtnH = 36.0f;
+
+    // CAPTURE ALL
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.55f, 0.18f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.70f, 0.24f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.06f, 0.42f, 0.14f, 1.0f));
     if (any_capturing || !any_active) ImGui::BeginDisabled();
-    if (ImGui::Button("CAPTURE ALL", button_size)) {
+    if (ImGui::Button("▶  Capture All", ImVec2(kActionBtnW, kActionBtnH))) {
       node->trigger_capture_all();
     }
     if (any_capturing || !any_active) ImGui::EndDisabled();
+    ImGui::PopStyleColor(3);
 
-    if (ImGui::InputText("Sync local root", node->sync_local_root_buf, sizeof(node->sync_local_root_buf))) {
+    // Sync root field — takes remaining space minus the sync button
+    ImGui::SameLine();
+    const float sync_btn_w2 = kActionBtnW;
+    const float root_w = ImGui::GetContentRegionAvail().x - sync_btn_w2
+                         - ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SetNextItemWidth(root_w);
+    if (ImGui::InputText("##sync_root", node->sync_local_root_buf, sizeof(node->sync_local_root_buf))) {
       node->mark_settings_dirty();
     }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+      ImGui::SetTooltip("Sync local root");
+    }
+
+    // COPY/SYNC ALL
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.35f, 0.60f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.45f, 0.75f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.14f, 0.28f, 0.50f, 1.0f));
     if (any_capturing) ImGui::BeginDisabled();
-    if (ImGui::Button("COPY/SYNC ALL", button_size)) {
+    if (ImGui::Button("⇄  Sync All", ImVec2(sync_btn_w2, kActionBtnH))) {
       node->sync_all_last_outputs();
     }
     if (any_capturing) ImGui::EndDisabled();
-
     ImGui::PopStyleColor(3);
 
+    ImGui::Spacing();
     ImGui::Separator();
 
     // ── Log box ────────────────────────────────────────────────────────

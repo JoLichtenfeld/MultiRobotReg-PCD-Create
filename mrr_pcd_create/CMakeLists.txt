@@ -12,6 +12,7 @@ find_package(PCL REQUIRED COMPONENTS common io)
 find_package(glfw3 REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(mrr_pcd_create_msgs REQUIRED)
+find_package(hector_multi_robot_msgs REQUIRED)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -41,14 +42,14 @@ add_executable(slave_node src/slave_node.cpp)
 target_link_libraries(slave_node ${PCL_LIBRARIES})
 target_include_directories(slave_node PRIVATE ${PCL_INCLUDE_DIRS})
 target_compile_definitions(slave_node PRIVATE ${PCL_DEFINITIONS})
-ament_target_dependencies(slave_node rclcpp rclcpp_action sensor_msgs pcl_conversions mrr_pcd_create_msgs)
+ament_target_dependencies(slave_node rclcpp rclcpp_action sensor_msgs pcl_conversions mrr_pcd_create_msgs hector_multi_robot_msgs)
 
 # Master UI node
 add_executable(ui_node src/ui_node.cpp)
 target_link_libraries(ui_node imgui_lib ${PCL_LIBRARIES})
 target_include_directories(ui_node PRIVATE ${PCL_INCLUDE_DIRS})
 target_compile_definitions(ui_node PRIVATE ${PCL_DEFINITIONS})
-ament_target_dependencies(ui_node rclcpp rclcpp_action sensor_msgs pcl_conversions mrr_pcd_create_msgs)
+ament_target_dependencies(ui_node rclcpp rclcpp_action sensor_msgs pcl_conversions mrr_pcd_create_msgs hector_multi_robot_msgs)
 
 install(TARGETS ui_node slave_node DESTINATION lib/${PROJECT_NAME})
 

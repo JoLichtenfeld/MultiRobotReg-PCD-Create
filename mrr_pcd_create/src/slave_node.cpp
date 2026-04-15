@@ -25,7 +25,6 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl_conversions/pcl_conversions.h>
 
-#include "mrr_pcd_create_msgs/msg/robot_announcement.hpp"
 #include "mrr_pcd_create_msgs/action/capture_pcd.hpp"
 
 enum class State { IDLE, RECORDING, DONE, ERR };
@@ -57,10 +56,6 @@ public:
     }
     robot_ns_ = normalize_namespace(configured_robot_ns);
 
-    // Publisher for robot announcements
-    announcement_pub_ = this->create_publisher<mrr_pcd_create_msgs::msg::RobotAnnouncement>(
-      "/mrr_pcd_announcement", rclcpp::SystemDefaultsQoS());
-
     capture_action_name_ = (robot_ns_ == "/") ? "/mrr_pcd_capture" : (robot_ns_ + "/mrr_pcd_capture");
 
     // Action server
@@ -71,11 +66,6 @@ public:
       std::bind(&SlaveNode::handle_cancel, this, std::placeholders::_1),
       std::bind(&SlaveNode::handle_accepted, this, std::placeholders::_1));
 
-    // Timer for periodic announcements (every 2 seconds)
-    announce_timer_ = this->create_wall_timer(
-      std::chrono::seconds(2),
-      std::bind(&SlaveNode::publish_announcement, this));
-
     RCLCPP_INFO(this->get_logger(), "Slave node for namespace '%s' started (capture action: %s)",
                 robot_ns_.c_str(), capture_action_name_.c_str());
   }
@@ -83,9 +73,7 @@ public:
 private:
   std::string robot_ns_;
   std::string capture_action_name_;
-  rclcpp::Publisher<mrr_pcd_create_msgs::msg::RobotAnnouncement>::SharedPtr announcement_pub_;
   rclcpp_action::Server<CapturePcd>::SharedPtr action_server_;
-  rclcpp::TimerBase::SharedPtr announce_timer_;
 
   static std::string normalize_namespace(std::string ns) {
     if (ns.empty()) {
@@ -100,33 +88,6 @@ private:
     return ns;
   }
 
-  bool topic_in_robot_namespace(const std::string & topic) const {
-    if (robot_ns_ == "/") {
-      return !topic.empty() && topic.front() == '/';
-    }
-    if (topic.rfind(robot_ns_, 0) != 0) {
-      return false;
-    }
-    if (topic.size() == robot_ns_.size()) {
-      return true;
-    }
-    return topic[robot_ns_.size()] == '/';
-  }
-
-  bool node_namespace_in_robot_namespace(const std::string & node_ns) const {
-    const std::string normalized = normalize_namespace(node_ns);
-    if (robot_ns_ == "/") {
-      return !normalized.empty() && normalized.front() == '/';
-    }
-    if (normalized.rfind(robot_ns_, 0) != 0) {
-      return false;
-    }
-    if (normalized.size() == robot_ns_.size()) {
-      return true;
-    }
-    return normalized[robot_ns_.size()] == '/';
-  }
-
   static bool has_xyz_fields(const sensor_msgs::msg::PointCloud2 & cloud) {
     bool has_x = false;
     bool has_y = false;
@@ -137,23 +98,6 @@ private:
       has_z = has_z || field.name == "z";
     }
     return has_x && has_y && has_z;
-  }
-
-  static bool type_name_has_suffix(const std::string & type_name, const std::string & suffix) {
-    if (type_name.size() < suffix.size()) {
-      return false;
-    }
-    return type_name.compare(type_name.size() - suffix.size(), suffix.size(), suffix) == 0;
-  }
-
-  static bool is_pointcloud2_type(const std::string & type_name) {
-    return type_name == "sensor_msgs/msg/PointCloud2" ||
-           type_name_has_suffix(type_name, "/PointCloud2");
-  }
-
-  static bool is_imu_type(const std::string & type_name) {
-    return type_name == "sensor_msgs/msg/Imu" ||
-           type_name_has_suffix(type_name, "/Imu");
   }
 
   static bool parse_transform_matrix(
@@ -272,37 +216,6 @@ private:
     if (elapsed >= static_cast<double>(acc_time_s)) {
       capture.done = true;
     }
-  }
-
-  // ---------- Announcement ----------
-  void publish_announcement() {
-    auto ann = mrr_pcd_create_msgs::msg::RobotAnnouncement();
-    ann.robot_ns = robot_ns_;
-    ann.capture_action_name = capture_action_name_;
-
-    // Discover available topics visible to this slave.
-    // Do not filter by namespace here: topic namespaces can differ from the
-    // robot identity namespace and would otherwise hide valid lidar/IMU topics.
-    for (const auto& [topic, types] : this->get_topic_names_and_types()) {
-      for (const auto& t : types) {
-        if (is_pointcloud2_type(t)) {
-          if (std::find(ann.available_pc_topics.begin(), ann.available_pc_topics.end(), topic) ==
-              ann.available_pc_topics.end()) {
-            ann.available_pc_topics.push_back(topic);
-          }
-        }
-        if (is_imu_type(t)) {
-          if (std::find(ann.available_imu_topics.begin(), ann.available_imu_topics.end(), topic) ==
-              ann.available_imu_topics.end()) {
-            ann.available_imu_topics.push_back(topic);
-          }
-        }
-      }
-    }
-    std::sort(ann.available_pc_topics.begin(), ann.available_pc_topics.end());
-    std::sort(ann.available_imu_topics.begin(), ann.available_imu_topics.end());
-
-    announcement_pub_->publish(ann);
   }
 
   // ---------- Action Server ----------

@@ -6,7 +6,6 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(action_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/RobotAnnouncement.msg"
   "action/CapturePcd.action"
   DEPENDENCIES action_msgs
 )
